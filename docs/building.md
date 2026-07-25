@@ -62,6 +62,52 @@ Dependencies vary depending on the distribution. You can reference our
 dependencies we use in Debian-based, Fedora-based and Arch-based distributions. Please submit a PR if you would like to extend the
 script to support other distributions.
 
+##### PyroWave encoder
+
+This fork can build an experimental PyroWave encoder for Linux. The integration
+uses PyroWave revision `509e4f887b585a3f97471fcc804e9de649f2c16f`,
+supports the matching Vulkan and Metal-v2 Moonlight negotiation modes, and uses
+the Linux KMS to Vulkan zero-copy path when the capture backend exposes Vulkan
+frames.
+
+Install the normal Sunshine build dependencies first, including CMake, Ninja,
+Git, pkg-config, a C++ compiler, and Vulkan development headers. Clone this
+repository recursively, then run:
+
+```bash
+./scripts/build_pyrowave_linux.sh \
+  -DBUILD_DOCS=OFF \
+  -DSUNSHINE_ENABLE_TRAY=OFF \
+  -DSUNSHINE_ENABLE_CUDA=OFF
+```
+
+The script clones and pins PyroWave under `cmake-build-pyrowave-src`, builds its
+shared C API into `cmake-build-pyrowave-prefix`, configures Sunshine with
+`SUNSHINE_ENABLE_PYROWAVE=ON`, and writes the Sunshine binary to
+`cmake-build-linux/sunshine`. You can pass any additional Sunshine CMake
+options after the script name.
+
+To use a pre-existing PyroWave checkout or choose different build locations,
+set `PYROWAVE_SOURCE_DIR`, `PYROWAVE_BUILD_DIR`, `PYROWAVE_PREFIX`, or
+`SUNSHINE_BUILD_DIR` before invoking the script. `BUILD_JOBS` controls build
+parallelism.
+
+For a manual build, install `pyrowave-shared.pc` and `libpyrowave-shared.so`
+under the same prefix, add its pkg-config directory to `PKG_CONFIG_PATH`, and
+configure Sunshine with:
+
+```bash
+PKG_CONFIG_PATH=/path/to/pyrowave-prefix/share/pkgconfig \
+  cmake -S . -B cmake-build-linux -G Ninja \
+    -DSUNSHINE_ENABLE_PYROWAVE=ON
+cmake --build cmake-build-linux --target sunshine
+```
+
+At runtime, `libpyrowave-shared.so.0` must be discoverable by the dynamic
+linker. The helper script records the local PyroWave library directory in the
+build-tree RPATH. Packaged installations should install the library into a
+system linker path or add that directory to the service environment.
+
 ##### KMS Capture
 If you are using KMS, patching the Sunshine binary with `setcap` is required. Some post-install scripts handle this. If building
 from source and using the binary directly, this will also work:

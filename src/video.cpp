@@ -395,7 +395,17 @@ namespace video {
   };
 
 #if defined(SUNSHINE_BUILD_PYROWAVE) && defined(SUNSHINE_BUILD_VULKAN) && defined(__linux__)
+  /**
+   * @brief Own the Vulkan objects and synchronization state shared with a PyroWave encoder.
+   */
   struct pyrowave_vulkan_device_state_t {
+    /**
+     * @brief Create a PyroWave device that reuses Sunshine's FFmpeg Vulkan device and queues.
+     *
+     * @param hw_frames_context FFmpeg Vulkan frames context used by the conversion device.
+     * @param out_device Receives the PyroWave device handle.
+     * @return PyroWave result code.
+     */
     pyrowave_result create(AVBufferRef *hw_frames_context, pyrowave_device *out_device) {
       auto *frames_context = reinterpret_cast<AVHWFramesContext *>(hw_frames_context->data);
       auto *device_context = reinterpret_cast<AVHWDeviceContext *>(frames_context->device_ref->data);
@@ -489,6 +499,16 @@ namespace video {
       return result;
     }
 
+    /**
+     * @brief Describe the converted Vulkan NV12 frame and its synchronization to PyroWave.
+     *
+     * @param conversion_device Sunshine Vulkan conversion device that owns the current frame.
+     * @param hw_frames_context FFmpeg Vulkan frames context associated with the frame.
+     * @param buffers Receives PyroWave plane descriptions.
+     * @param acquire Receives the semaphore wait operation.
+     * @param release Receives the semaphore signal operation.
+     * @return True when the frame can be consumed directly by PyroWave.
+     */
     bool prepare_input(
       platf::avcodec_encode_device_t &conversion_device,
       AVBufferRef *hw_frames_context,
@@ -573,6 +593,9 @@ namespace video {
       return true;
     }
 
+    /**
+     * @brief Publish PyroWave's release timeline value back to the FFmpeg Vulkan frame.
+     */
     void complete_input() {
       if (!pending_frame) {
         return;
@@ -585,35 +608,58 @@ namespace video {
       pending_frame = nullptr;
     }
 
-    AVVulkanDeviceContext *vulkan_context = nullptr;
-    uint32_t queue_family = UINT32_MAX;
-    uint32_t queue_create_info_count = 0;
-    std::array<float, 2> queue_priorities {1.0f, 1.0f};
-    VkApplicationInfo application_info {};
-    VkInstanceCreateInfo instance_create_info {};
-    std::array<VkDeviceQueueCreateInfo, 2> queue_create_infos {};
-    VkDeviceCreateInfo device_create_info {};
-    std::array<pyrowave_device_create_queue_info, 2> queue_infos {};
-    pyrowave_device_create_info create_info {};
-    AVVkFrame *pending_frame = nullptr;
-    uint64_t pending_release_value = 0;
-    int image_count = 0;
+    AVVulkanDeviceContext *vulkan_context = nullptr;  ///< FFmpeg Vulkan device shared with PyroWave.
+    uint32_t queue_family = UINT32_MAX;  ///< Compute queue family used by PyroWave.
+    uint32_t queue_create_info_count = 0;  ///< Number of queue descriptions passed to PyroWave.
+    std::array<float, 2> queue_priorities {1.0f, 1.0f};  ///< Stable storage for queue priorities.
+    VkApplicationInfo application_info {};  ///< Stable Vulkan application info for the imported device.
+    VkInstanceCreateInfo instance_create_info {};  ///< Stable Vulkan instance description for the imported device.
+    std::array<VkDeviceQueueCreateInfo, 2> queue_create_infos {};  ///< Stable Vulkan queue descriptions.
+    VkDeviceCreateInfo device_create_info {};  ///< Stable Vulkan device description for PyroWave.
+    std::array<pyrowave_device_create_queue_info, 2> queue_infos {};  ///< Live Vulkan queue handles.
+    pyrowave_device_create_info create_info {};  ///< PyroWave imported-device descriptor.
+    AVVkFrame *pending_frame = nullptr;  ///< Frame awaiting release synchronization.
+    uint64_t pending_release_value = 0;  ///< Timeline value signaled after the current encode.
+    int image_count = 0;  ///< Number of Vulkan images used by the current NV12 frame.
   };
 #endif
 
 #ifdef SUNSHINE_BUILD_PYROWAVE
   namespace {
+    /**
+     * @brief Test whether a negotiated video format selects PyroWave.
+     *
+     * @param video_format GameStream bitstream format.
+     * @return True for the Vulkan or Metal-v2 PyroWave formats.
+     */
     bool is_pyrowave_format(int video_format) {
       return video_format == 3 || video_format == 4;
     }
 
+    /**
+     * @brief Test whether a negotiated video format selects the Metal-v2 client mode.
+     *
+     * @param video_format GameStream bitstream format.
+     * @return True for the Metal-v2 PyroWave format.
+     */
     bool is_pyrowave_metal_format(int video_format) {
       return video_format == 4;
     }
   }  // namespace
 
+  /**
+   * @brief Encode session for PyroWave CPU input or Linux Vulkan zero-copy input.
+   */
   class pyrowave_encode_session_t: public encode_session_t {
   public:
+    /**
+     * @brief Construct a PyroWave session that uploads software-converted YUV input.
+     *
+     * @param conversion_device Software conversion device that produces YUV420P frames.
+     * @param device_handle PyroWave device owned by the session.
+     * @param encoder_handle PyroWave encoder owned by the session.
+     * @param config Negotiated stream configuration.
+     */
     pyrowave_encode_session_t(
       std::unique_ptr<avcodec_software_encode_device_t> conversion_device,
       pyrowave_device device_handle,
@@ -627,6 +673,16 @@ namespace video {
     }
 
 #if defined(SUNSHINE_BUILD_VULKAN) && defined(__linux__)
+    /**
+     * @brief Construct a PyroWave session that consumes shared Vulkan NV12 frames.
+     *
+     * @param conversion_device Vulkan conversion device that produces NV12 frames.
+     * @param hw_frames_context FFmpeg Vulkan frames context owned by the session.
+     * @param vulkan_state Shared-device and synchronization state owned by the session.
+     * @param device_handle PyroWave device owned by the session.
+     * @param encoder_handle PyroWave encoder owned by the session.
+     * @param config Negotiated stream configuration.
+     */
     pyrowave_encode_session_t(
       std::unique_ptr<platf::avcodec_encode_device_t> conversion_device,
       avcodec_buffer_t hw_frames_context,
@@ -645,6 +701,9 @@ namespace video {
     }
 #endif
 
+    /**
+     * @brief Destroy the PyroWave encoder and device.
+     */
     ~pyrowave_encode_session_t() override {
       if (encoder_handle) {
         pyrowave_encoder_destroy(encoder_handle);
@@ -654,21 +713,42 @@ namespace video {
       }
     }
 
+    /**
+     * @brief Convert a captured image into the input frame used by PyroWave.
+     *
+     * @param img Captured platform image.
+     * @return Zero on success, otherwise an encoder conversion error.
+     */
     int convert(platf::img_t &img) override {
       return conversion_device ? conversion_device->convert(img) : -1;
     }
 
+    /**
+     * @brief Accept an IDR request; every PyroWave frame is independently decodable.
+     */
     void request_idr_frame() override {
       // PyroWave is intra-only, so every frame is independently decodable.
     }
 
+    /**
+     * @brief Accept a normal-frame request; PyroWave does not maintain a GOP.
+     */
     void request_normal_frame() override {
     }
 
+    /**
+     * @brief Accept a reference invalidation request; PyroWave has no reference frames.
+     */
     void invalidate_ref_frames(int64_t, int64_t) override {
       // PyroWave has no reference frames to invalidate.
     }
 
+    /**
+     * @brief Encode and packetize one converted frame.
+     *
+     * @param frame_index GameStream frame index assigned to the output packet.
+     * @return Encoded PyroWave packet, or nullptr on failure.
+     */
     packet_t encode_frame(int64_t frame_index) {
       if (!conversion_device || !encoder_handle) {
         return nullptr;
@@ -780,16 +860,16 @@ namespace video {
       return std::make_unique<packet_raw_generic>(std::move(frame_data), frame_index, true);
     }
 
-    private:
-    std::unique_ptr<platf::encode_device_t> conversion_device;
+  private:
+    std::unique_ptr<platf::encode_device_t> conversion_device;  ///< Input conversion device.
 #if defined(SUNSHINE_BUILD_VULKAN) && defined(__linux__)
-    avcodec_buffer_t hw_frames_context;
-    std::unique_ptr<pyrowave_vulkan_device_state_t> vulkan_state;
+    avcodec_buffer_t hw_frames_context;  ///< FFmpeg Vulkan frames context for zero-copy input.
+    std::unique_ptr<pyrowave_vulkan_device_state_t> vulkan_state;  ///< Shared Vulkan device state.
 #endif
-    pyrowave_device device_handle = nullptr;
-    pyrowave_encoder encoder_handle = nullptr;
-    config_t config;
-    bool gpu_input = false;
+    pyrowave_device device_handle = nullptr;  ///< Owned PyroWave device.
+    pyrowave_encoder encoder_handle = nullptr;  ///< Owned PyroWave encoder.
+    config_t config;  ///< Negotiated stream configuration.
+    bool gpu_input = false;  ///< Whether the session consumes shared Vulkan frames.
   };
 #endif
 
@@ -2767,6 +2847,15 @@ namespace video {
   }
 
 #ifdef SUNSHINE_BUILD_PYROWAVE
+  /**
+   * @brief Create a PyroWave encode session for the negotiated input path.
+   *
+   * @param config Negotiated stream configuration.
+   * @param capture_width Captured display width.
+   * @param capture_height Captured display height.
+   * @param encode_device Platform conversion device created for the stream.
+   * @return PyroWave encode session, or nullptr when initialization fails.
+   */
   std::unique_ptr<pyrowave_encode_session_t> make_pyrowave_encode_session(
     const config_t &config,
     int capture_width,
