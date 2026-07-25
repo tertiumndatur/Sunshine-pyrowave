@@ -20,6 +20,7 @@ option(SUNSHINE_ENABLE_TRAY "Enable system tray icon." ON)
 
 option(SUNSHINE_SYSTEM_VULKAN_HEADERS "Use system installation of vulkan-headers rather than the submodule." OFF)
 option(SUNSHINE_SYSTEM_WAYLAND_PROTOCOLS "Use system installation of wayland-protocols rather than the submodule." OFF)
+option(SUNSHINE_ENABLE_PYROWAVE "Enable experimental PyroWave video encoding." OFF)
 
 if(APPLE)
     option(BOOST_USE_STATIC "Use static boost libraries." OFF)

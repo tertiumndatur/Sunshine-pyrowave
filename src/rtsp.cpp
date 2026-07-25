@@ -957,6 +957,16 @@ namespace rtsp_stream {
       ss << "a=rtpmap:98 AV1/90000"sv << std::endl;
     }
 
+#ifdef SUNSHINE_BUILD_PYROWAVE
+    // The two client builds use distinct negotiation IDs. Bitstream
+    // compatibility between the pinned Vulkan PyroWave and PyrowaveKit v2
+    // revisions is covered by a cross-decoder smoke test.
+    ss << "a=rtpmap:99 PYROWAVE/90000"sv << std::endl;
+    ss << "a=x-ss-video.pyrowave:1"sv << std::endl;
+    ss << "a=rtpmap:100 PYROWAVE-METAL-V2/90000"sv << std::endl;
+    ss << "a=x-ss-video.pyrowave-metal-v2:1"sv << std::endl;
+#endif
+
     if (!session.surround_params.empty()) {
       // If we have our own surround parameters, advertise them twice first
       ss << "a=fmtp:97 surround-params="sv << session.surround_params << std::endl;
@@ -1201,6 +1211,7 @@ namespace rtsp_stream {
       config.monitor.dynamicRange = (int) util::from_view(args.at("x-nv-video[0].dynamicRangeMode"sv));
       config.monitor.chromaSamplingType = (int) util::from_view(args.at("x-ss-video[0].chromaSamplingType"sv));
       config.monitor.enableIntraRefresh = (int) util::from_view(args.at("x-ss-video[0].intraRefresh"sv));
+      config.monitor.packetSize = config.packetsize - sizeof(NV_VIDEO_PACKET);
 
       configuredBitrateKbps = util::from_view(args.at("x-ml-video.configuredBitrateKbps"sv));
     } catch (std::out_of_range &) {
@@ -1286,6 +1297,15 @@ namespace rtsp_stream {
       respond(sock, session, &option, 400, "BAD REQUEST", req->sequenceNumber, {});
       return;
     }
+
+#ifndef SUNSHINE_BUILD_PYROWAVE
+    if (config.monitor.videoFormat >= 3 && config.monitor.videoFormat <= 6) {
+      BOOST_LOG(warning) << "PyroWave is disabled, yet the client requested it"sv;
+
+      respond(sock, session, &option, 400, "BAD REQUEST", req->sequenceNumber, {});
+      return;
+    }
+#endif
 
     // Check that any required encryption is enabled
     auto encryption_mode = net::encryption_mode_for_address(sock.remote_endpoint().address());

@@ -34,6 +34,12 @@ find_package(PkgConfig REQUIRED)
 find_package(Threads REQUIRED)
 pkg_check_modules(CURL REQUIRED libcurl)
 
+if(SUNSHINE_ENABLE_PYROWAVE)
+    pkg_check_modules(PYROWAVE REQUIRED IMPORTED_TARGET pyrowave-shared)
+    list(APPEND SUNSHINE_EXTERNAL_LIBRARIES PkgConfig::PYROWAVE)
+    list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_BUILD_PYROWAVE=1)
+endif()
+
 # miniupnp
 pkg_check_modules(MINIUPNP miniupnpc REQUIRED)
 include_directories(SYSTEM ${MINIUPNP_INCLUDE_DIRS})

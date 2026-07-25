@@ -35,10 +35,11 @@ namespace video {
     int slicesPerFrame;  ///< Number of slices per frame.
     int numRefFrames;  ///< Maximum number of reference frames.
     int encoderCscMode;  ///< Requested color range and SDR colorspace; HDR always uses BT.2020 and ST2084.
-    int videoFormat;  ///< Video codec format: 0 = H.264, 1 = HEVC, 2 = AV1.
+    int videoFormat;  ///< Video codec format: 0 = H.264, 1 = HEVC, 2 = AV1, 3/4 = PyroWave Vulkan/Metal.
     int dynamicRange;  ///< Encoding color depth: 0 = 8-bit, 1 = 10-bit.
     int chromaSamplingType;  ///< Chroma sampling type: 0 = 4:2:0, 1 = 4:4:4.
     int enableIntraRefresh;  ///< Intra refresh setting: 0 = disabled, 1 = enabled.
+    int packetSize = 0;  ///< Maximum codec payload bytes per Moonlight data packet.
   };
 
   namespace amf {
@@ -344,6 +345,13 @@ namespace video {
           return hevc;
         case 2:
           return av1;
+        case 3:
+        case 4:
+        case 5:
+        case 6:
+          // PyroWave has its own encode session. H.264 is used only as the
+          // platform-format template while the capture device is created.
+          return h264;
       }
     }
 
@@ -459,7 +467,16 @@ namespace video {
       }
     };
 
+    /**
+     * @brief Describes a codec-defined network fragment within the encoded payload.
+     */
+    struct fragment_t {
+      size_t offset;  ///< Byte offset into the encoded payload.
+      size_t size;  ///< Fragment size in bytes.
+    };
+
     std::vector<replace_t> *replacements = nullptr;  ///< Optional encoded-byte substitutions applied before packetization.
+    std::vector<fragment_t> network_fragments;  ///< Codec-defined packet boundaries that must be preserved.
     void *channel_data = nullptr;  ///< Platform or protocol state carried with this packet.
     bool after_ref_frame_invalidation = false;  ///< Whether the frame follows reference-frame invalidation.
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp;  ///< Capture timestamp associated with the frame.

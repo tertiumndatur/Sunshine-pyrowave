@@ -1522,9 +1522,16 @@ namespace stream {
       frame_header.frameType = packet->is_idr()                     ? 2 :
                                packet->after_ref_frame_invalidation ? 5 :
                                                                       1;
-      frame_header.lastPayloadLen = (payload.size() + sizeof(frame_header)) % (session->config.packetsize - sizeof(NV_VIDEO_PACKET));
-      if (frame_header.lastPayloadLen == 0) {
-        frame_header.lastPayloadLen = session->config.packetsize - sizeof(NV_VIDEO_PACKET);
+      const auto codec_payload_blocksize = session->config.packetsize - sizeof(NV_VIDEO_PACKET);
+      if (!packet->network_fragments.empty()) {
+        const auto &last_fragment = packet->network_fragments.back();
+        frame_header.lastPayloadLen = last_fragment.size +
+                                      (packet->network_fragments.size() == 1 ? sizeof(frame_header) : 0);
+      } else {
+        frame_header.lastPayloadLen = (payload.size() + sizeof(frame_header)) % codec_payload_blocksize;
+        if (frame_header.lastPayloadLen == 0) {
+          frame_header.lastPayloadLen = codec_payload_blocksize;
+        }
       }
 
       if (packet->frame_timestamp) {
@@ -1545,7 +1552,37 @@ namespace stream {
       // Insert space for packet headers
       auto blocksize = session->config.packetsize + MAX_RTP_HEADER_SIZE;
       auto payload_blocksize = blocksize - sizeof(video_packet_raw_t);
-      auto payload_new = concat_and_insert(sizeof(video_packet_raw_t), payload_blocksize, std::string_view {(char *) &frame_header, sizeof(frame_header)}, payload);
+      std::vector<uint8_t> payload_new;
+      if (packet->network_fragments.empty()) {
+        payload_new = concat_and_insert(sizeof(video_packet_raw_t), payload_blocksize, std::string_view {(char *) &frame_header, sizeof(frame_header)}, payload);
+      } else {
+        // Some codecs, including PyroWave, define their own network packet
+        // boundaries. Preserve each boundary as one Moonlight data shard rather
+        // than slicing a concatenated frame at arbitrary byte offsets.
+        payload_new.resize(packet->network_fragments.size() * blocksize);
+        bool fragments_valid = true;
+        for (size_t index = 0; index < packet->network_fragments.size(); ++index) {
+          const auto &fragment = packet->network_fragments[index];
+          const auto prefix_size = index == 0 ? sizeof(frame_header) : 0;
+          if (fragment.offset + fragment.size > payload.size() ||
+              prefix_size + fragment.size > payload_blocksize) {
+            BOOST_LOG(error) << "Invalid codec network fragment "sv << index << " (offset "
+                             << fragment.offset << ", size " << fragment.size << ')';
+            fragments_valid = false;
+            break;
+          }
+
+          auto *destination = payload_new.data() + index * blocksize + sizeof(video_packet_raw_t);
+          if (index == 0) {
+            std::copy_n((const uint8_t *) &frame_header, sizeof(frame_header), destination);
+            destination += sizeof(frame_header);
+          }
+          std::copy_n((const uint8_t *) payload.data() + fragment.offset, fragment.size, destination);
+        }
+        if (!fragments_valid) {
+          continue;
+        }
+      }
 
       payload = std::string_view {(char *) payload_new.data(), payload_new.size()};
 

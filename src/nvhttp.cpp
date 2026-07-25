@@ -914,7 +914,12 @@ namespace nvhttp {
       tree.put("root.LocalIP", net::addr_to_normalized_string(local_endpoint.address()));
     }
 
-    const uint32_t codec_mode_flags = get_codec_mode_flags();
+    uint32_t codec_mode_flags = get_codec_mode_flags();
+#ifdef SUNSHINE_BUILD_PYROWAVE
+    // Sunshine extensions mirrored by the matching Moonlight client build.
+    codec_mode_flags |= 0x00800000;  // SCM_PYROWAVE
+    codec_mode_flags |= 0x01000000;  // SCM_PYROWAVE_METAL
+#endif
     tree.put("root.ServerCodecModeSupport", codec_mode_flags);
 
     if (!config::nvhttp.external_ip.empty()) {

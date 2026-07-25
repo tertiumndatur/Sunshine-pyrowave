@@ -6,18 +6,28 @@
 #include <array>
 #include <atomic>
 #include <bitset>
+#include <chrono>
 #include <list>
 #include <thread>
 #include <utility>
+#include <vector>
 
 // lib includes
 #include <boost/pointer_cast.hpp>
+
+#ifdef SUNSHINE_BUILD_PYROWAVE
+  #include <vulkan/vulkan.h>
+  #include <pyrowave.h>
+#endif
 
 extern "C" {
 #include <libavutil/imgutils.h>
 #include <libavutil/mastering_display_metadata.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
+#if defined(SUNSHINE_BUILD_PYROWAVE) && defined(SUNSHINE_BUILD_VULKAN) && defined(__linux__)
+  #include <libavutil/hwcontext_vulkan.h>
+#endif
 }
 
 // local includes
@@ -383,6 +393,405 @@ namespace video {
     int offsetW;  ///< Offset w.
     int offsetH;  ///< Offset h.
   };
+
+#if defined(SUNSHINE_BUILD_PYROWAVE) && defined(SUNSHINE_BUILD_VULKAN) && defined(__linux__)
+  struct pyrowave_vulkan_device_state_t {
+    pyrowave_result create(AVBufferRef *hw_frames_context, pyrowave_device *out_device) {
+      auto *frames_context = reinterpret_cast<AVHWFramesContext *>(hw_frames_context->data);
+      auto *device_context = reinterpret_cast<AVHWDeviceContext *>(frames_context->device_ref->data);
+      vulkan_context = reinterpret_cast<AVVulkanDeviceContext *>(device_context->hwctx);
+
+      // PyroWave's direct interop API needs a description of the already-created
+      // Vulkan device. Keep every structure alive for the lifetime of the
+      // pyrowave_device, as required by its API.
+      uint32_t graphics_queue_family = UINT32_MAX;
+      queue_family = UINT32_MAX;
+      for (int i = 0; i < vulkan_context->nb_qf; ++i) {
+        const auto flags = vulkan_context->qf[i].flags;
+        if (graphics_queue_family == UINT32_MAX && (flags & VK_QUEUE_GRAPHICS_BIT)) {
+          graphics_queue_family = vulkan_context->qf[i].idx;
+        }
+        // Match vk_vram_t: it selects the first compute-capable family in
+        // FFmpeg's preferentially ordered queue-family list.
+        if (queue_family == UINT32_MAX && (flags & VK_QUEUE_COMPUTE_BIT)) {
+          queue_family = vulkan_context->qf[i].idx;
+        }
+      }
+      if (graphics_queue_family == UINT32_MAX || queue_family == UINT32_MAX) {
+        BOOST_LOG(error) << "PyroWave zero-copy requires Vulkan graphics and compute queues"sv;
+        return PYROWAVE_ERROR_NO_VULKAN;
+      }
+
+      queue_create_info_count = graphics_queue_family == queue_family ? 1 : 2;
+      const std::array<uint32_t, 2> families {graphics_queue_family, queue_family};
+      for (uint32_t i = 0; i < queue_create_info_count; ++i) {
+        VkQueue queue = VK_NULL_HANDLE;
+        vkGetDeviceQueue(vulkan_context->act_dev, families[i], 0, &queue);
+        if (queue == VK_NULL_HANDLE) {
+          BOOST_LOG(error) << "Unable to retrieve Vulkan queue family "sv << families[i]
+                           << " for PyroWave zero-copy"sv;
+          return PYROWAVE_ERROR_NO_VULKAN;
+        }
+
+        queue_create_infos[i].sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+        queue_create_infos[i].queueFamilyIndex = families[i];
+        queue_create_infos[i].queueCount = 1;
+        queue_create_infos[i].pQueuePriorities = &queue_priorities[i];
+
+        queue_infos[i].queue = queue;
+        queue_infos[i].familyIndex = families[i];
+        queue_infos[i].index = 0;
+      }
+
+      application_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+      application_info.pApplicationName = "Sunshine PyroWave zero-copy";
+      application_info.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
+      application_info.pEngineName = "Sunshine";
+      application_info.engineVersion = VK_MAKE_VERSION(1, 0, 0);
+      application_info.apiVersion = VK_API_VERSION_1_3;
+
+      instance_create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+      instance_create_info.pApplicationInfo = &application_info;
+      instance_create_info.enabledExtensionCount = vulkan_context->nb_enabled_inst_extensions;
+      instance_create_info.ppEnabledExtensionNames = vulkan_context->enabled_inst_extensions;
+
+      device_create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+      device_create_info.pNext = &vulkan_context->device_features;
+      device_create_info.queueCreateInfoCount = queue_create_info_count;
+      device_create_info.pQueueCreateInfos = queue_create_infos.data();
+      device_create_info.enabledExtensionCount = vulkan_context->nb_enabled_dev_extensions;
+      device_create_info.ppEnabledExtensionNames = vulkan_context->enabled_dev_extensions;
+
+      create_info = {};
+      create_info.GetInstanceProcAddr = vulkan_context->get_proc_addr ?
+                                           vulkan_context->get_proc_addr :
+                                           vkGetInstanceProcAddr;
+      create_info.instance = vulkan_context->inst;
+      create_info.physical_device = vulkan_context->phys_dev;
+      create_info.device = vulkan_context->act_dev;
+      create_info.instance_create_info = &instance_create_info;
+      create_info.device_create_info = &device_create_info;
+      create_info.queue_info = queue_infos.data();
+      create_info.queue_info_count = queue_create_info_count;
+
+      auto result = pyrowave_create_device(&create_info, out_device);
+      if (result != PYROWAVE_SUCCESS) {
+        return result;
+      }
+
+      // Commit 509e4f8: prefer a dedicated async-compute queue when one is
+      // available, otherwise PyroWave falls back to the graphics queue.
+      result = pyrowave_device_set_queue_type(*out_device, VK_QUEUE_COMPUTE_BIT);
+      if (result != PYROWAVE_SUCCESS) {
+        pyrowave_device_destroy(*out_device);
+        *out_device = nullptr;
+      }
+      return result;
+    }
+
+    bool prepare_input(
+      platf::avcodec_encode_device_t &conversion_device,
+      AVBufferRef *hw_frames_context,
+      pyrowave_gpu_buffers &buffers,
+      pyrowave_gpu_sync_operation &acquire,
+      pyrowave_gpu_sync_operation &release
+    ) {
+      auto *frame = conversion_device.frame;
+      if (!frame || !frame->data[0]) {
+        BOOST_LOG(error) << "PyroWave zero-copy input has no Vulkan AVFrame"sv;
+        return false;
+      }
+
+      auto *vk_frame = reinterpret_cast<AVVkFrame *>(frame->data[0]);
+      auto *frames_context = reinterpret_cast<AVHWFramesContext *>(hw_frames_context->data);
+      auto *vk_frames_context = reinterpret_cast<AVVulkanFramesContext *>(frames_context->hwctx);
+      if (frames_context->sw_format != AV_PIX_FMT_NV12) {
+        BOOST_LOG(error) << "PyroWave zero-copy expected an NV12 Vulkan frame"sv;
+        return false;
+      }
+
+      image_count = 0;
+      while (image_count < AV_NUM_DATA_POINTERS && vk_frame->img[image_count] != VK_NULL_HANDLE) {
+        ++image_count;
+      }
+      if (image_count != 1 && image_count != 2) {
+        BOOST_LOG(error) << "Unsupported Vulkan NV12 image count for PyroWave: "sv << image_count;
+        return false;
+      }
+
+      auto set_plane = [&](int plane, int image_index, VkFormat view_format,
+                           VkImageAspectFlagBits aspect, VkComponentSwizzle swizzle) {
+        auto &dst = buffers.planes[plane];
+        dst.image = vk_frame->img[image_index];
+        dst.width = frame->width;
+        dst.height = frame->height;
+        dst.image_format = vk_frames_context->format[image_index];
+        dst.view_format = view_format;
+        dst.mip_level = 0;
+        dst.layer = 0;
+        dst.aspect = aspect;
+        dst.swizzle = swizzle;
+        dst.layout = vk_frame->layout[image_index];
+      };
+
+      if (image_count == 1) {
+        set_plane(0, 0, VK_FORMAT_R8_UNORM, VK_IMAGE_ASPECT_PLANE_0_BIT, VK_COMPONENT_SWIZZLE_R);
+        set_plane(1, 0, VK_FORMAT_R8G8_UNORM, VK_IMAGE_ASPECT_PLANE_1_BIT, VK_COMPONENT_SWIZZLE_R);
+        set_plane(2, 0, VK_FORMAT_R8G8_UNORM, VK_IMAGE_ASPECT_PLANE_1_BIT, VK_COMPONENT_SWIZZLE_G);
+      } else {
+        set_plane(0, 0, VK_FORMAT_R8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, VK_COMPONENT_SWIZZLE_R);
+        set_plane(1, 1, VK_FORMAT_R8G8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, VK_COMPONENT_SWIZZLE_R);
+        set_plane(2, 1, VK_FORMAT_R8G8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, VK_COMPONENT_SWIZZLE_G);
+
+        // The PyroWave API currently accepts one acquire/release semaphore.
+        // FFmpeg normally allocates NV12 as one multiplane image. Permit the
+        // two-image fallback only when both images share the same timeline.
+        if (vk_frame->sem[1] != vk_frame->sem[0] ||
+            vk_frame->sem_value[1] != vk_frame->sem_value[0]) {
+          BOOST_LOG(error) << "Two-image Vulkan NV12 uses independent semaphores; zero-copy cannot synchronize it"sv;
+          return false;
+        }
+      }
+
+      for (int i = 0; i < image_count; ++i) {
+        if (vk_frame->layout[i] != VK_IMAGE_LAYOUT_GENERAL &&
+            vk_frame->layout[i] != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL &&
+            vk_frame->layout[i] != VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL) {
+          BOOST_LOG(error) << "Unsupported Vulkan input layout for PyroWave: "sv << vk_frame->layout[i];
+          return false;
+        }
+      }
+
+      acquire = {};
+      release = {};
+      acquire.sync.semaphore = vk_frame->sem[0];
+      acquire.sync.value = vk_frame->sem_value[0];
+      release.sync.semaphore = vk_frame->sem[0];
+      release.sync.value = vk_frame->sem_value[0] + 1;
+      pending_release_value = release.sync.value;
+      pending_frame = vk_frame;
+      return true;
+    }
+
+    void complete_input() {
+      if (!pending_frame) {
+        return;
+      }
+      for (int i = 0; i < image_count; ++i) {
+        pending_frame->sem_value[i] = pending_release_value;
+        pending_frame->access[i] = VK_ACCESS_SHADER_READ_BIT;
+        pending_frame->queue_family[i] = queue_family;
+      }
+      pending_frame = nullptr;
+    }
+
+    AVVulkanDeviceContext *vulkan_context = nullptr;
+    uint32_t queue_family = UINT32_MAX;
+    uint32_t queue_create_info_count = 0;
+    std::array<float, 2> queue_priorities {1.0f, 1.0f};
+    VkApplicationInfo application_info {};
+    VkInstanceCreateInfo instance_create_info {};
+    std::array<VkDeviceQueueCreateInfo, 2> queue_create_infos {};
+    VkDeviceCreateInfo device_create_info {};
+    std::array<pyrowave_device_create_queue_info, 2> queue_infos {};
+    pyrowave_device_create_info create_info {};
+    AVVkFrame *pending_frame = nullptr;
+    uint64_t pending_release_value = 0;
+    int image_count = 0;
+  };
+#endif
+
+#ifdef SUNSHINE_BUILD_PYROWAVE
+  namespace {
+    bool is_pyrowave_format(int video_format) {
+      return video_format == 3 || video_format == 4;
+    }
+
+    bool is_pyrowave_metal_format(int video_format) {
+      return video_format == 4;
+    }
+  }  // namespace
+
+  class pyrowave_encode_session_t: public encode_session_t {
+  public:
+    pyrowave_encode_session_t(
+      std::unique_ptr<avcodec_software_encode_device_t> conversion_device,
+      pyrowave_device device_handle,
+      pyrowave_encoder encoder_handle,
+      config_t config
+    ):
+        conversion_device {std::move(conversion_device)},
+        device_handle {device_handle},
+        encoder_handle {encoder_handle},
+        config {config} {
+    }
+
+#if defined(SUNSHINE_BUILD_VULKAN) && defined(__linux__)
+    pyrowave_encode_session_t(
+      std::unique_ptr<platf::avcodec_encode_device_t> conversion_device,
+      avcodec_buffer_t hw_frames_context,
+      std::unique_ptr<pyrowave_vulkan_device_state_t> vulkan_state,
+      pyrowave_device device_handle,
+      pyrowave_encoder encoder_handle,
+      config_t config
+    ):
+        conversion_device {std::move(conversion_device)},
+        hw_frames_context {std::move(hw_frames_context)},
+        vulkan_state {std::move(vulkan_state)},
+        device_handle {device_handle},
+        encoder_handle {encoder_handle},
+        config {config},
+        gpu_input {true} {
+    }
+#endif
+
+    ~pyrowave_encode_session_t() override {
+      if (encoder_handle) {
+        pyrowave_encoder_destroy(encoder_handle);
+      }
+      if (device_handle) {
+        pyrowave_device_destroy(device_handle);
+      }
+    }
+
+    int convert(platf::img_t &img) override {
+      return conversion_device ? conversion_device->convert(img) : -1;
+    }
+
+    void request_idr_frame() override {
+      // PyroWave is intra-only, so every frame is independently decodable.
+    }
+
+    void request_normal_frame() override {
+    }
+
+    void invalidate_ref_frames(int64_t, int64_t) override {
+      // PyroWave has no reference frames to invalidate.
+    }
+
+    packet_t encode_frame(int64_t frame_index) {
+      if (!conversion_device || !encoder_handle) {
+        return nullptr;
+      }
+
+      const auto configured_bitrate_kbps =
+        (config::video.max_bitrate > 0) ? std::min(config.bitrate, config::video.max_bitrate) : config.bitrate;
+      const auto frames_per_second = std::max(config.framerate, 1);
+      const size_t maximum_bitstream_size = std::max<size_t>(
+        16 * 1024,
+        ((uint64_t) std::max(configured_bitrate_kbps, 1) * 1000 + (8 * frames_per_second - 1)) /
+          (8 * frames_per_second)
+      );
+
+      pyrowave_rate_control rate_control {maximum_bitstream_size};
+      pyrowave_result result;
+
+#if defined(SUNSHINE_BUILD_VULKAN) && defined(__linux__)
+      if (gpu_input) {
+        auto *vulkan_conversion_device = dynamic_cast<platf::avcodec_encode_device_t *>(conversion_device.get());
+        pyrowave_gpu_buffers gpu_buffers {};
+        pyrowave_gpu_sync_operation acquire {};
+        pyrowave_gpu_sync_operation release {};
+        if (!vulkan_conversion_device ||
+            !vulkan_state->prepare_input(*vulkan_conversion_device, hw_frames_context.get(), gpu_buffers, acquire, release)) {
+          return nullptr;
+        }
+        result = pyrowave_encoder_encode_gpu_synchronous(
+          encoder_handle,
+          acquire.sync.semaphore != VK_NULL_HANDLE ? &acquire : nullptr,
+          release.sync.semaphore != VK_NULL_HANDLE ? &release : nullptr,
+          &gpu_buffers,
+          &rate_control
+        );
+        if (result == PYROWAVE_SUCCESS) {
+          vulkan_state->complete_input();
+        }
+      } else
+#endif
+      {
+        auto *software_conversion_device = dynamic_cast<platf::avcodec_encode_device_t *>(conversion_device.get());
+        if (!software_conversion_device || !software_conversion_device->frame) {
+          return nullptr;
+        }
+        const auto *frame = software_conversion_device->frame;
+        pyrowave_cpu_buffer cpu_buffer {};
+        cpu_buffer.data[0] = frame->data[0];
+        cpu_buffer.data[1] = frame->data[1];
+        cpu_buffer.data[2] = frame->data[2];
+        cpu_buffer.row_stride_in_bytes[0] = frame->linesize[0];
+        cpu_buffer.row_stride_in_bytes[1] = frame->linesize[1];
+        cpu_buffer.row_stride_in_bytes[2] = frame->linesize[2];
+        cpu_buffer.plane_size_in_bytes[0] = (size_t) frame->linesize[0] * config.height;
+        cpu_buffer.plane_size_in_bytes[1] = (size_t) frame->linesize[1] * (config.height / 2);
+        cpu_buffer.plane_size_in_bytes[2] = (size_t) frame->linesize[2] * (config.height / 2);
+        cpu_buffer.width = config.width;
+        cpu_buffer.height = config.height;
+        cpu_buffer.format = PYROWAVE_CPU_BUFFER_FORMAT_YUV420P;
+        result = pyrowave_encoder_encode_cpu_synchronous(encoder_handle, &cpu_buffer, &rate_control);
+      }
+
+      if (result != PYROWAVE_SUCCESS) {
+        BOOST_LOG(error) << "PyroWave encode failed: "sv << (int) result;
+        return nullptr;
+      }
+
+      // Packetize the complete codec frame here, then let Sunshine's regular
+      // RTP layer fragment it. Moonlight joins those fragments before passing
+      // the frame to PyroWave.
+      const size_t packet_boundary = maximum_bitstream_size;
+      size_t packet_count = 0;
+      result = pyrowave_encoder_compute_num_packets(encoder_handle, packet_boundary, &packet_count);
+      if (result != PYROWAVE_SUCCESS || packet_count == 0) {
+        BOOST_LOG(error) << "PyroWave packet count failed: "sv << (int) result;
+        return nullptr;
+      }
+
+      std::vector<pyrowave_packet> pyrowave_packets(packet_count);
+      std::vector<uint8_t> raw_bitstream(maximum_bitstream_size);
+      size_t output_packet_count = packet_count;
+      result = pyrowave_encoder_packetize(
+        encoder_handle,
+        pyrowave_packets.data(),
+        packet_boundary,
+        &output_packet_count,
+        raw_bitstream.data(),
+        raw_bitstream.size()
+      );
+      if (result != PYROWAVE_SUCCESS || output_packet_count == 0) {
+        BOOST_LOG(error) << "PyroWave packetization failed: "sv << (int) result;
+        return nullptr;
+      }
+
+      std::vector<uint8_t> frame_data;
+      frame_data.reserve(maximum_bitstream_size);
+
+      for (size_t packet_index = 0; packet_index < output_packet_count; ++packet_index) {
+        const auto &source_packet = pyrowave_packets[packet_index];
+        if (source_packet.offset + source_packet.size > raw_bitstream.size()) {
+          BOOST_LOG(error) << "Invalid PyroWave codec packet "sv << packet_index << " (offset "
+                           << source_packet.offset << ", size " << source_packet.size << ')';
+          return nullptr;
+        }
+
+        const auto *source_begin = raw_bitstream.data() + source_packet.offset;
+        frame_data.insert(frame_data.end(), source_begin, source_begin + source_packet.size);
+      }
+
+      return std::make_unique<packet_raw_generic>(std::move(frame_data), frame_index, true);
+    }
+
+    private:
+    std::unique_ptr<platf::encode_device_t> conversion_device;
+#if defined(SUNSHINE_BUILD_VULKAN) && defined(__linux__)
+    avcodec_buffer_t hw_frames_context;
+    std::unique_ptr<pyrowave_vulkan_device_state_t> vulkan_state;
+#endif
+    pyrowave_device device_handle = nullptr;
+    pyrowave_encoder encoder_handle = nullptr;
+    config_t config;
+    bool gpu_input = false;
+  };
+#endif
 
   /**
    * @brief Enumerates supported flag options.
@@ -1424,6 +1833,22 @@ namespace video {
   std::array<bool, 3> last_encoder_probe_supported_yuv444_for_codec = {};  ///< YUV444 support discovered for each probed codec.
 
   /**
+   * @brief Select the capture memory type required for a stream.
+   *
+   * @param encoder Selected encoder and its platform formats.
+   * @param config Client video configuration.
+   * @return Vulkan memory for Linux PyroWave streams, otherwise the encoder's native memory type.
+   */
+  platf::mem_type_e capture_memory_type(const encoder_t &encoder, const config_t &config) {
+#if defined(SUNSHINE_BUILD_PYROWAVE) && defined(SUNSHINE_BUILD_VULKAN) && defined(__linux__)
+    if (is_pyrowave_format(config.videoFormat)) {
+      return platf::mem_type_e::vulkan;
+    }
+#endif
+    return encoder.platform_formats->dev_type;
+  }
+
+  /**
    * @brief Recreate a display capture object after a capture failure.
    *
    * @param disp Display connection or display handle.
@@ -1540,8 +1965,9 @@ namespace video {
     // get the most up-to-date list available monitors
     std::vector<std::string> display_names;
     int display_p = -1;
-    refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
-    auto disp = platf::display(encoder.platform_formats->dev_type, display_names[display_p], capture_ctxs.front().config);
+    auto capture_type = capture_memory_type(encoder, capture_ctxs.front().config);
+    refresh_displays(capture_type, display_names, display_p);
+    auto disp = platf::display(capture_type, display_names[display_p], capture_ctxs.front().config);
     if (!disp) {
       return;
     }
@@ -1729,7 +2155,8 @@ namespace video {
               disp.reset();
 
               // Refresh display names since a display removal might have caused the reinitialization
-              refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
+              capture_type = capture_memory_type(encoder, capture_ctxs.front().config);
+              refresh_displays(capture_type, display_names, display_p);
 
               // Process any pending display switch with the new list of displays
               if (switch_display_event->peek()) {
@@ -1737,7 +2164,7 @@ namespace video {
               }
 
               // reset_display() will sleep between retries
-              reset_display(disp, encoder.platform_formats->dev_type, display_names[display_p], capture_ctxs.front().config);
+              reset_display(disp, capture_type, display_names[display_p], capture_ctxs.front().config);
               if (disp) {
                 break;
               }
@@ -1877,6 +2304,30 @@ namespace video {
     return 0;
   }
 
+#ifdef SUNSHINE_BUILD_PYROWAVE
+  /**
+   * @brief Encode one frame with PyroWave and queue it for transmission.
+   *
+   * @param frame_nr Frame number.
+   * @param session Active PyroWave encode session.
+   * @param packets Output packet queue.
+   * @param channel_data Platform or protocol state carried with the packet.
+   * @param frame_timestamp Capture timestamp associated with the frame.
+   * @return 0 when encoded and queued, or -1 on failure.
+   */
+  int encode_pyrowave(int64_t frame_nr, pyrowave_encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
+    auto packet = session.encode_frame(frame_nr);
+    if (!packet) {
+      return -1;
+    }
+
+    packet->channel_data = channel_data;
+    packet->frame_timestamp = frame_timestamp;
+    packets->raise(std::move(packet));
+    return 0;
+  }
+#endif
+
   /**
    * @brief Encode one captured frame and queue packets for transmission.
    *
@@ -1892,6 +2343,10 @@ namespace video {
       return encode_avcodec(frame_nr, *avcodec_session, packets, channel_data, frame_timestamp);
     } else if (auto nvenc_session = dynamic_cast<nvenc_encode_session_t *>(&session)) {
       return encode_nvenc(frame_nr, *nvenc_session, packets, channel_data, frame_timestamp);
+#ifdef SUNSHINE_BUILD_PYROWAVE
+    } else if (auto pyrowave_session = dynamic_cast<pyrowave_encode_session_t *>(&session)) {
+      return encode_pyrowave(frame_nr, *pyrowave_session, packets, channel_data, frame_timestamp);
+#endif
     }
 
     return -1;
@@ -2311,6 +2766,181 @@ namespace video {
     return std::make_unique<nvenc_encode_session_t>(std::move(encode_device));
   }
 
+#ifdef SUNSHINE_BUILD_PYROWAVE
+  std::unique_ptr<pyrowave_encode_session_t> make_pyrowave_encode_session(
+    const config_t &config,
+    int capture_width,
+    int capture_height,
+    std::unique_ptr<platf::encode_device_t> encode_device
+  ) {
+    if (config.dynamicRange || config.chromaSamplingType != 0) {
+      BOOST_LOG(error) << "PyroWave currently supports SDR 8-bit YUV 4:2:0 streams only"sv;
+      return nullptr;
+    }
+    if ((config.width & 1) != 0 || (config.height & 1) != 0) {
+      BOOST_LOG(error) << "PyroWave requires even stream dimensions"sv;
+      return nullptr;
+    }
+
+    auto colorspace = encode_device->colorspace;
+
+#if defined(SUNSHINE_BUILD_VULKAN) && defined(__linux__)
+    // KMS zero-copy path. The display hands us a DMA-BUF descriptor, the
+    // Vulkan conversion device imports it and writes NV12, and PyroWave reads
+    // the same VkImage on the same VkDevice.
+    auto *raw_vulkan_device = dynamic_cast<platf::avcodec_encode_device_t *>(encode_device.get());
+    if (raw_vulkan_device && raw_vulkan_device->data) {
+      std::unique_ptr<platf::avcodec_encode_device_t> vulkan_conversion_device {
+        static_cast<platf::avcodec_encode_device_t *>(encode_device.release())
+      };
+
+      auto hw_device_or_error = vulkan_init_avcodec_hardware_input_buffer(vulkan_conversion_device.get());
+      if (hw_device_or_error.has_right()) {
+        BOOST_LOG(error) << "Failed to create the shared Vulkan device for PyroWave"sv;
+        return nullptr;
+      }
+      auto hw_device_context = std::move(hw_device_or_error.left());
+      avcodec_buffer_t hw_frames_context {av_hwframe_ctx_alloc(hw_device_context.get())};
+      if (!hw_frames_context) {
+        BOOST_LOG(error) << "Failed to allocate the PyroWave Vulkan frames context"sv;
+        return nullptr;
+      }
+
+      auto *frames_context = reinterpret_cast<AVHWFramesContext *>(hw_frames_context->data);
+      frames_context->format = AV_PIX_FMT_VULKAN;
+      frames_context->sw_format = AV_PIX_FMT_NV12;
+      frames_context->width = config.width;
+      frames_context->height = config.height;
+      frames_context->initial_pool_size = 0;
+      vulkan_conversion_device->init_hwframes(frames_context);
+
+      // PyroWave samples the image from compute shaders. Do not request the
+      // Vulkan Video encode usage bit: that path may be unavailable on this
+      // GPU even though generic Vulkan compute works perfectly.
+      auto *vk_frames_context = reinterpret_cast<AVVulkanFramesContext *>(frames_context->hwctx);
+      vk_frames_context->usage = static_cast<VkImageUsageFlagBits>(
+        VK_IMAGE_USAGE_STORAGE_BIT |
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+        VK_IMAGE_USAGE_SAMPLED_BIT
+      );
+
+      if (av_hwframe_ctx_init(hw_frames_context.get()) < 0) {
+        BOOST_LOG(error) << "Failed to initialize the PyroWave Vulkan frames context"sv;
+        return nullptr;
+      }
+
+      avcodec_frame_t frame {av_frame_alloc()};
+      if (!frame) {
+        return nullptr;
+      }
+      frame->format = AV_PIX_FMT_VULKAN;
+      frame->width = config.width;
+      frame->height = config.height;
+      const auto avcodec_colorspace = avcodec_colorspace_from_sunshine_colorspace(colorspace);
+      frame->color_range = avcodec_colorspace.range;
+      frame->color_primaries = avcodec_colorspace.primaries;
+      frame->color_trc = avcodec_colorspace.transfer_function;
+      frame->colorspace = avcodec_colorspace.matrix;
+
+      if (vulkan_conversion_device->set_frame(frame.release(), hw_frames_context.get())) {
+        BOOST_LOG(error) << "Failed to attach the Vulkan frame to the PyroWave converter"sv;
+        return nullptr;
+      }
+      vulkan_conversion_device->colorspace = colorspace;
+      vulkan_conversion_device->apply_colorspace();
+
+      auto vulkan_state = std::make_unique<pyrowave_vulkan_device_state_t>();
+      pyrowave_device device = nullptr;
+      auto result = vulkan_state->create(hw_frames_context.get(), &device);
+      if (result != PYROWAVE_SUCCESS) {
+        BOOST_LOG(error) << "Failed to share Sunshine's Vulkan device with PyroWave: "sv << (int) result;
+        return nullptr;
+      }
+
+      pyrowave_encoder encoder = nullptr;
+      pyrowave_encoder_create_info encoder_info {};
+      encoder_info.device = device;
+      encoder_info.width = config.width;
+      encoder_info.height = config.height;
+      encoder_info.chroma = PYROWAVE_CHROMA_SUBSAMPLING_420;
+      result = pyrowave_encoder_create(&encoder_info, &encoder);
+      if (result != PYROWAVE_SUCCESS) {
+        BOOST_LOG(error) << "Failed to create the PyroWave zero-copy encoder: "sv << (int) result;
+        pyrowave_device_destroy(device);
+        return nullptr;
+      }
+
+      BOOST_LOG(info) << "PyroWave Vulkan zero-copy encoder initialized at "sv
+                      << config.width << 'x' << config.height
+                      << " (KMS DMA-BUF -> Vulkan NV12 -> GPU encode)"sv;
+      return std::make_unique<pyrowave_encode_session_t>(
+        std::move(vulkan_conversion_device),
+        std::move(hw_frames_context),
+        std::move(vulkan_state),
+        device,
+        encoder,
+        config
+      );
+    }
+#endif
+
+    avcodec_frame_t frame {av_frame_alloc()};
+    if (!frame) {
+      return nullptr;
+    }
+    frame->format = AV_PIX_FMT_YUV420P;
+    frame->width = config.width;
+    frame->height = config.height;
+
+    const auto avcodec_colorspace = avcodec_colorspace_from_sunshine_colorspace(colorspace);
+    frame->color_range = avcodec_colorspace.range;
+    frame->color_primaries = avcodec_colorspace.primaries;
+    frame->color_trc = avcodec_colorspace.transfer_function;
+    frame->colorspace = avcodec_colorspace.matrix;
+
+    auto conversion_device = std::make_unique<avcodec_software_encode_device_t>();
+    if (conversion_device->init(capture_width, capture_height, frame.get(), AV_PIX_FMT_YUV420P, false)) {
+      BOOST_LOG(error) << "Failed to initialize PyroWave colorspace conversion"sv;
+      return nullptr;
+    }
+    conversion_device->colorspace = colorspace;
+    if (conversion_device->set_frame(frame.release(), nullptr)) {
+      return nullptr;
+    }
+    conversion_device->apply_colorspace();
+
+    pyrowave_device device = nullptr;
+    auto result = pyrowave_create_default_device(&device);
+    if (result != PYROWAVE_SUCCESS) {
+      BOOST_LOG(error) << "Failed to create PyroWave Vulkan device: "sv << (int) result;
+      return nullptr;
+    }
+
+    pyrowave_encoder encoder = nullptr;
+    pyrowave_encoder_create_info encoder_info {};
+    encoder_info.device = device;
+    encoder_info.width = config.width;
+    encoder_info.height = config.height;
+    encoder_info.chroma = PYROWAVE_CHROMA_SUBSAMPLING_420;
+    result = pyrowave_encoder_create(&encoder_info, &encoder);
+    if (result != PYROWAVE_SUCCESS) {
+      BOOST_LOG(error) << "Failed to create PyroWave encoder: "sv << (int) result;
+      pyrowave_device_destroy(device);
+      return nullptr;
+    }
+
+    BOOST_LOG(info) << "PyroWave "sv
+                    << (is_pyrowave_metal_format(config.videoFormat) ? "Metal v2 bitstream"sv : "Vulkan bitstream"sv)
+                    << " encoder initialized at "sv << config.width << 'x' << config.height;
+    return std::make_unique<pyrowave_encode_session_t>(
+      std::move(conversion_device),
+      device,
+      encoder,
+      config
+    );
+  }
+#endif
+
   /**
    * @brief Create encode session.
    *
@@ -2323,6 +2953,11 @@ namespace video {
    * @return Constructed encode session object.
    */
   std::unique_ptr<encode_session_t> make_encode_session(platf::display_t *disp, const encoder_t &encoder, const config_t &config, int width, int height, std::unique_ptr<platf::encode_device_t> encode_device) {
+#ifdef SUNSHINE_BUILD_PYROWAVE
+    if (is_pyrowave_format(config.videoFormat)) {
+      return make_pyrowave_encode_session(config, width, height, std::move(encode_device));
+    }
+#endif
     if (dynamic_cast<platf::avcodec_encode_device_t *>(encode_device.get())) {
       auto avcodec_encode_device = boost::dynamic_pointer_cast<platf::avcodec_encode_device_t>(std::move(encode_device));
       return make_avcodec_encode_session(disp, encoder, config, width, height, std::move(avcodec_encode_device));
@@ -2544,9 +3179,12 @@ namespace video {
     }
 
     {
-      auto encoder_name = encoder.codec_from_config(config).name;
+      auto encoder_name =
+        config.videoFormat == 3 ? "pyrowave-vulkan"sv :
+        config.videoFormat == 4 ? "pyrowave-metal-v2"sv :
+                                  std::string_view {encoder.codec_from_config(config).name};
 
-      BOOST_LOG(info) << "Creating encoder " << logging::bracket(encoder_name);
+      BOOST_LOG(info) << "Creating encoder " << logging::bracket(std::string {encoder_name});
 
       auto color_coding = colorspace.colorspace == colorspace_e::bt2020    ? "HDR (Rec. 2020 + SMPTE 2084 PQ)" :
                           colorspace.colorspace == colorspace_e::rec601    ? "SDR (Rec. 601)" :
@@ -2653,7 +3291,8 @@ namespace video {
 
     while (encode_session_ctx_queue.running()) {
       // Refresh display names since a display removal might have caused the reinitialization
-      refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
+      auto capture_type = capture_memory_type(encoder, synced_session_ctxs.front()->config);
+      refresh_displays(capture_type, display_names, display_p);
 
       // Process any pending display switch with the new list of displays
       if (switch_display_event->peek()) {
@@ -2661,7 +3300,7 @@ namespace video {
       }
 
       // reset_display() will sleep between retries
-      reset_display(disp, encoder.platform_formats->dev_type, display_names[display_p], synced_session_ctxs.front()->config);
+      reset_display(disp, capture_type, display_names[display_p], synced_session_ctxs.front()->config);
       if (disp) {
         break;
       }
