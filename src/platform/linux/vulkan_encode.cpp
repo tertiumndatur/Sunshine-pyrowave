@@ -212,8 +212,8 @@ namespace vk {
       vk_dev.ctx = (AVVulkanDeviceContext *) dev_ctx->hwctx;
       vk_dev.dev = vk_dev.ctx->act_dev;
       vk_dev.phys_dev = vk_dev.ctx->phys_dev;
-      is_10bit = (frames_ctx->sw_format == AV_PIX_FMT_P010);
-      is_yuv444 = (frames_ctx->sw_format == AV_PIX_FMT_YUV444P);
+      is_10bit = frames_ctx->sw_format == AV_PIX_FMT_P010 || frames_ctx->sw_format == AV_PIX_FMT_YUV444P10;
+      is_yuv444 = frames_ctx->sw_format == AV_PIX_FMT_YUV444P || frames_ctx->sw_format == AV_PIX_FMT_YUV444P10;
 
       {
         VkPhysicalDeviceProperties p;
@@ -731,12 +731,11 @@ namespace vk {
 
         VkImageViewCreateInfo view_ci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         view_ci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        view_ci.format = VK_FORMAT_R8_UNORM;
+        view_ci.format = y_fmt;
 
         if (num_imgs == 1) {
-          // FFmpeg maps AV_PIX_FMT_YUV444P to one
-          // VK_FORMAT_G8_B8_R8_3PLANE_444_UNORM image. Address each plane
-          // through a mutable R8 view of its Vulkan plane aspect.
+          // FFmpeg maps planar 4:4:4 to one three-plane Vulkan image. Address
+          // each plane through a mutable R8 or R16 view of its plane aspect.
           view_ci.image = vk_frame->img[0];
           view_ci.subresourceRange = {VK_IMAGE_ASPECT_PLANE_0_BIT, 0, 1, 0, 1};
           VK_CHECK_BOOL(vkCreateImageView(vk_dev.dev, &view_ci, nullptr, &target.y_view));

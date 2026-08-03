@@ -528,9 +528,12 @@ namespace video {
       auto *vk_frame = reinterpret_cast<AVVkFrame *>(frame->data[0]);
       auto *frames_context = reinterpret_cast<AVHWFramesContext *>(hw_frames_context->data);
       auto *vk_frames_context = reinterpret_cast<AVVulkanFramesContext *>(frames_context->hwctx);
-      const bool yuv444 = frames_context->sw_format == AV_PIX_FMT_YUV444P;
-      if (!yuv444 && frames_context->sw_format != AV_PIX_FMT_NV12) {
-        BOOST_LOG(error) << "PyroWave zero-copy expected an NV12 or YUV444P Vulkan frame"sv;
+      const bool yuv444 = frames_context->sw_format == AV_PIX_FMT_YUV444P ||
+                          frames_context->sw_format == AV_PIX_FMT_YUV444P10;
+      const bool ten_bit = frames_context->sw_format == AV_PIX_FMT_P010 ||
+                           frames_context->sw_format == AV_PIX_FMT_YUV444P10;
+      if (!yuv444 && frames_context->sw_format != AV_PIX_FMT_NV12 && frames_context->sw_format != AV_PIX_FMT_P010) {
+        BOOST_LOG(error) << "PyroWave zero-copy expected an NV12, P010, YUV444P, or YUV444P10 Vulkan frame"sv;
         return false;
       }
 
@@ -539,10 +542,14 @@ namespace video {
         ++image_count;
       }
       if ((yuv444 && image_count != 1 && image_count != 3) || (!yuv444 && image_count != 1 && image_count != 2)) {
-        BOOST_LOG(error) << "Unsupported Vulkan "sv << (yuv444 ? "YUV444P"sv : "NV12"sv)
+        BOOST_LOG(error) << "Unsupported Vulkan "sv
+                         << (yuv444 ? (ten_bit ? "YUV444P10"sv : "YUV444P"sv) : (ten_bit ? "P010"sv : "NV12"sv))
                          << " image count for PyroWave: "sv << image_count;
         return false;
       }
+
+      const auto y_format = ten_bit ? VK_FORMAT_R16_UNORM : VK_FORMAT_R8_UNORM;
+      const auto uv_format = ten_bit ? VK_FORMAT_R16G16_UNORM : VK_FORMAT_R8G8_UNORM;
 
       auto set_plane = [&](int plane, int image_index, VkFormat view_format, VkImageAspectFlagBits aspect, VkComponentSwizzle swizzle) {
         auto &dst = buffers.planes[plane];
@@ -559,13 +566,13 @@ namespace video {
       };
 
       if (yuv444 && image_count == 1) {
-        set_plane(0, 0, VK_FORMAT_R8_UNORM, VK_IMAGE_ASPECT_PLANE_0_BIT, VK_COMPONENT_SWIZZLE_R);
-        set_plane(1, 0, VK_FORMAT_R8_UNORM, VK_IMAGE_ASPECT_PLANE_1_BIT, VK_COMPONENT_SWIZZLE_R);
-        set_plane(2, 0, VK_FORMAT_R8_UNORM, VK_IMAGE_ASPECT_PLANE_2_BIT, VK_COMPONENT_SWIZZLE_R);
+        set_plane(0, 0, y_format, VK_IMAGE_ASPECT_PLANE_0_BIT, VK_COMPONENT_SWIZZLE_R);
+        set_plane(1, 0, y_format, VK_IMAGE_ASPECT_PLANE_1_BIT, VK_COMPONENT_SWIZZLE_R);
+        set_plane(2, 0, y_format, VK_IMAGE_ASPECT_PLANE_2_BIT, VK_COMPONENT_SWIZZLE_R);
       } else if (yuv444) {
-        set_plane(0, 0, VK_FORMAT_R8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, VK_COMPONENT_SWIZZLE_R);
-        set_plane(1, 1, VK_FORMAT_R8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, VK_COMPONENT_SWIZZLE_R);
-        set_plane(2, 2, VK_FORMAT_R8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, VK_COMPONENT_SWIZZLE_R);
+        set_plane(0, 0, y_format, VK_IMAGE_ASPECT_COLOR_BIT, VK_COMPONENT_SWIZZLE_R);
+        set_plane(1, 1, y_format, VK_IMAGE_ASPECT_COLOR_BIT, VK_COMPONENT_SWIZZLE_R);
+        set_plane(2, 2, y_format, VK_IMAGE_ASPECT_COLOR_BIT, VK_COMPONENT_SWIZZLE_R);
 
         // PyroWave accepts a single acquire/release timeline. Separate YUV444
         // images are safe only when FFmpeg exposes one shared timeline value.
@@ -577,13 +584,13 @@ namespace video {
           return false;
         }
       } else if (image_count == 1) {
-        set_plane(0, 0, VK_FORMAT_R8_UNORM, VK_IMAGE_ASPECT_PLANE_0_BIT, VK_COMPONENT_SWIZZLE_R);
-        set_plane(1, 0, VK_FORMAT_R8G8_UNORM, VK_IMAGE_ASPECT_PLANE_1_BIT, VK_COMPONENT_SWIZZLE_R);
-        set_plane(2, 0, VK_FORMAT_R8G8_UNORM, VK_IMAGE_ASPECT_PLANE_1_BIT, VK_COMPONENT_SWIZZLE_G);
+        set_plane(0, 0, y_format, VK_IMAGE_ASPECT_PLANE_0_BIT, VK_COMPONENT_SWIZZLE_R);
+        set_plane(1, 0, uv_format, VK_IMAGE_ASPECT_PLANE_1_BIT, VK_COMPONENT_SWIZZLE_R);
+        set_plane(2, 0, uv_format, VK_IMAGE_ASPECT_PLANE_1_BIT, VK_COMPONENT_SWIZZLE_G);
       } else {
-        set_plane(0, 0, VK_FORMAT_R8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, VK_COMPONENT_SWIZZLE_R);
-        set_plane(1, 1, VK_FORMAT_R8G8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, VK_COMPONENT_SWIZZLE_R);
-        set_plane(2, 1, VK_FORMAT_R8G8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, VK_COMPONENT_SWIZZLE_G);
+        set_plane(0, 0, y_format, VK_IMAGE_ASPECT_COLOR_BIT, VK_COMPONENT_SWIZZLE_R);
+        set_plane(1, 1, uv_format, VK_IMAGE_ASPECT_COLOR_BIT, VK_COMPONENT_SWIZZLE_R);
+        set_plane(2, 1, uv_format, VK_IMAGE_ASPECT_COLOR_BIT, VK_COMPONENT_SWIZZLE_G);
 
         // The PyroWave API currently accepts one acquire/release semaphore.
         // FFmpeg normally allocates NV12 as one multiplane image. Permit the
@@ -2887,11 +2894,13 @@ namespace video {
     int capture_height,
     std::unique_ptr<platf::encode_device_t> encode_device
   ) {
-    if (config.dynamicRange || (config.chromaSamplingType != 0 && config.chromaSamplingType != 1)) {
-      BOOST_LOG(error) << "PyroWave supports SDR 8-bit YUV 4:2:0 and 4:4:4 streams"sv;
+    if ((config.dynamicRange != 0 && config.dynamicRange != 1) ||
+        (config.chromaSamplingType != 0 && config.chromaSamplingType != 1)) {
+      BOOST_LOG(error) << "PyroWave supports SDR and HDR10 YUV 4:2:0 and 4:4:4 streams"sv;
       return nullptr;
     }
     const bool yuv444 = config.chromaSamplingType == 1;
+    const bool hdr10 = config.dynamicRange == 1;
     if (!yuv444 && ((config.width & 1) != 0 || (config.height & 1) != 0)) {
       BOOST_LOG(error) << "PyroWave requires even stream dimensions"sv;
       return nullptr;
@@ -2924,7 +2933,9 @@ namespace video {
 
       auto *frames_context = reinterpret_cast<AVHWFramesContext *>(hw_frames_context->data);
       frames_context->format = AV_PIX_FMT_VULKAN;
-      frames_context->sw_format = yuv444 ? AV_PIX_FMT_YUV444P : AV_PIX_FMT_NV12;
+      frames_context->sw_format = hdr10 ?
+                                      (yuv444 ? AV_PIX_FMT_YUV444P10 : AV_PIX_FMT_P010) :
+                                      (yuv444 ? AV_PIX_FMT_YUV444P : AV_PIX_FMT_NV12);
       frames_context->width = config.width;
       frames_context->height = config.height;
       frames_context->initial_pool_size = 0;
@@ -2990,9 +3001,13 @@ namespace video {
 
       BOOST_LOG(info) << "PyroWave Vulkan zero-copy encoder initialized at "sv
                       << config.width << 'x' << config.height
-                      << (yuv444 ?
-                            " (KMS DMA-BUF -> Vulkan YUV444P -> GPU encode)"sv :
-                            " (KMS DMA-BUF -> Vulkan NV12 -> GPU encode)"sv);
+                      << (hdr10 ?
+                            (yuv444 ?
+                               " (HDR10 KMS DMA-BUF -> Vulkan YUV444P10 -> GPU encode)"sv :
+                               " (HDR10 KMS DMA-BUF -> Vulkan P010 -> GPU encode)"sv) :
+                            (yuv444 ?
+                               " (SDR KMS DMA-BUF -> Vulkan YUV444P -> GPU encode)"sv :
+                               " (SDR KMS DMA-BUF -> Vulkan NV12 -> GPU encode)"sv));
       return std::make_unique<pyrowave_encode_session_t>(
         std::move(vulkan_conversion_device),
         std::move(hw_frames_context),
@@ -3003,6 +3018,11 @@ namespace video {
       );
     }
   #endif
+
+    if (hdr10) {
+      BOOST_LOG(error) << "PyroWave HDR10 requires the Linux Vulkan zero-copy path"sv;
+      return nullptr;
+    }
 
     avcodec_frame_t frame {av_frame_alloc()};
     if (!frame) {
@@ -3292,7 +3312,9 @@ namespace video {
       if (is_pyrowave_format(config.videoFormat)) {
         // The Vulkan PyroWave path allocates its own planar YUV444 frame. The
         // capture backend only uses this value to choose the conversion device.
-        pix_fmt = encoder.platform_formats->pix_fmt_8bit;
+        pix_fmt = colorspace.bit_depth == 10 ?
+                    encoder.platform_formats->pix_fmt_10bit :
+                    encoder.platform_formats->pix_fmt_8bit;
       } else
 #endif
       {

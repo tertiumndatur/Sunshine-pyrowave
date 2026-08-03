@@ -920,6 +920,8 @@ namespace nvhttp {
     codec_mode_flags |= 0x00800000;  // SCM_PYROWAVE
     codec_mode_flags |= 0x01000000;  // SCM_PYROWAVE_METAL
     codec_mode_flags |= 0x02000000;  // SCM_PYROWAVE_444
+    codec_mode_flags |= 0x04000000;  // SCM_PYROWAVE_MAIN10
+    codec_mode_flags |= 0x08000000;  // SCM_PYROWAVE_MAIN10_444
 #endif
     tree.put("root.ServerCodecModeSupport", codec_mode_flags);
 
