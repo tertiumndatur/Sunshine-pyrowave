@@ -68,7 +68,8 @@ This fork can build an experimental PyroWave encoder for Linux. The integration
 uses PyroWave revision `509e4f887b585a3f97471fcc804e9de649f2c16f`,
 supports the matching Vulkan and Metal-v2 Moonlight negotiation modes, and uses
 the Linux KMS to Vulkan zero-copy path when the capture backend exposes Vulkan
-frames.
+frames. PyroWave streams support SDR 8-bit YUV 4:2:0 and YUV 4:4:4; both use
+GPU-side RGB-to-YUV conversion and encode on the shared Vulkan device.
 
 Install the normal Sunshine build dependencies first, including CMake, Ninja,
 Git, pkg-config, a C++ compiler, and Vulkan development headers. Clone this

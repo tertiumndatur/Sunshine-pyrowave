@@ -123,6 +123,7 @@ namespace vk {
     std::array<int32_t, 2> cursor_pos;  ///< Cursor pos.
     std::array<int32_t, 2> cursor_size;  ///< Cursor size.
     int32_t y_invert;  ///< Y invert.
+    int32_t chroma_444;  ///< Write planar full-resolution U and V when nonzero.
   };
 
 // Helper to check VkResult
@@ -212,6 +213,7 @@ namespace vk {
       vk_dev.dev = vk_dev.ctx->act_dev;
       vk_dev.phys_dev = vk_dev.ctx->phys_dev;
       is_10bit = (frames_ctx->sw_format == AV_PIX_FMT_P010);
+      is_yuv444 = (frames_ctx->sw_format == AV_PIX_FMT_YUV444P);
 
       {
         VkPhysicalDeviceProperties p;
@@ -359,6 +361,7 @@ namespace vk {
       push.dst_full_size[0] = frame->width;
       push.dst_full_size[1] = frame->height;
       push.y_invert = descriptor.y_invert ? 1 : 0;
+      push.chroma_444 = is_yuv444 ? 1 : 0;
 
       if (descriptor.data) {
         float scale_x = (float) eff_w / width;
@@ -383,12 +386,13 @@ namespace vk {
       shader_ci.pCode = rgb2yuv_comp_spv_data.data();
       VK_CHECK_BOOL(vkCreateShaderModule(vk_dev.dev, &shader_ci, nullptr, &compute.shader_module));
 
-      // Descriptor set layout: binding 0=sampler, 1=Y storage, 2=UV storage, 3=cursor sampler
-      std::array<VkDescriptorSetLayoutBinding, 4> bindings = {};
+      // Descriptor set layout: binding 0=sampler, 1=Y, 2=U/UV, 3=V, 4=cursor sampler
+      std::array<VkDescriptorSetLayoutBinding, 5> bindings = {};
       bindings[0] = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
       bindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
       bindings[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-      bindings[3] = {3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+      bindings[3] = {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+      bindings[4] = {4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
 
       VkDescriptorSetLayoutCreateInfo ds_layout_ci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
       ds_layout_ci.bindingCount = bindings.size();
@@ -417,7 +421,7 @@ namespace vk {
       // Descriptor pool
       std::array<VkDescriptorPoolSize, 2> pool_sizes = {{
         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2},
-        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2},
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3},
       }};
       VkDescriptorPoolCreateInfo pool_ci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
       pool_ci.maxSets = 1;
@@ -719,7 +723,37 @@ namespace vk {
         num_imgs++;
       }
 
-      if (num_imgs == 1) {
+      if (is_yuv444) {
+        if (num_imgs != 1 && num_imgs != 3) {
+          BOOST_LOG(error) << "Vulkan YUV444 conversion expected 1 multiplanar or 3 planar images, got "sv << num_imgs;
+          return false;
+        }
+
+        VkImageViewCreateInfo view_ci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        view_ci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        view_ci.format = VK_FORMAT_R8_UNORM;
+
+        if (num_imgs == 1) {
+          // FFmpeg maps AV_PIX_FMT_YUV444P to one
+          // VK_FORMAT_G8_B8_R8_3PLANE_444_UNORM image. Address each plane
+          // through a mutable R8 view of its Vulkan plane aspect.
+          view_ci.image = vk_frame->img[0];
+          view_ci.subresourceRange = {VK_IMAGE_ASPECT_PLANE_0_BIT, 0, 1, 0, 1};
+          VK_CHECK_BOOL(vkCreateImageView(vk_dev.dev, &view_ci, nullptr, &target.y_view));
+          view_ci.subresourceRange = {VK_IMAGE_ASPECT_PLANE_1_BIT, 0, 1, 0, 1};
+          VK_CHECK_BOOL(vkCreateImageView(vk_dev.dev, &view_ci, nullptr, &target.uv_view));
+          view_ci.subresourceRange = {VK_IMAGE_ASPECT_PLANE_2_BIT, 0, 1, 0, 1};
+          VK_CHECK_BOOL(vkCreateImageView(vk_dev.dev, &view_ci, nullptr, &target.v_view));
+        } else {
+          view_ci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+          view_ci.image = vk_frame->img[0];
+          VK_CHECK_BOOL(vkCreateImageView(vk_dev.dev, &view_ci, nullptr, &target.y_view));
+          view_ci.image = vk_frame->img[1];
+          VK_CHECK_BOOL(vkCreateImageView(vk_dev.dev, &view_ci, nullptr, &target.uv_view));
+          view_ci.image = vk_frame->img[2];
+          VK_CHECK_BOOL(vkCreateImageView(vk_dev.dev, &view_ci, nullptr, &target.v_view));
+        }
+      } else if (num_imgs == 1) {
         // Single multiplane image — create plane views
         VkImageViewCreateInfo view_ci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         view_ci.image = vk_frame->img[0];
@@ -755,13 +789,15 @@ namespace vk {
       VkDescriptorImageInfo src_info = {compute.sampler, src.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
       VkDescriptorImageInfo y_info = {VK_NULL_HANDLE, target.y_view, VK_IMAGE_LAYOUT_GENERAL};
       VkDescriptorImageInfo uv_info = {VK_NULL_HANDLE, target.uv_view, VK_IMAGE_LAYOUT_GENERAL};
+      VkDescriptorImageInfo v_info = {VK_NULL_HANDLE, is_yuv444 ? target.v_view : target.uv_view, VK_IMAGE_LAYOUT_GENERAL};
       VkDescriptorImageInfo cursor_info = {compute.sampler, cursor.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
 
-      std::array<VkWriteDescriptorSet, 4> writes = {};
+      std::array<VkWriteDescriptorSet, 5> writes = {};
       writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, compute.desc_set, 0, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &src_info, nullptr, nullptr};
       writes[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, compute.desc_set, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &y_info, nullptr, nullptr};
       writes[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, compute.desc_set, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &uv_info, nullptr, nullptr};
-      writes[3] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, compute.desc_set, 3, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &cursor_info, nullptr, nullptr};
+      writes[3] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, compute.desc_set, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &v_info, nullptr, nullptr};
+      writes[4] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, compute.desc_set, 4, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &cursor_info, nullptr, nullptr};
       vkUpdateDescriptorSets(vk_dev.dev, writes.size(), writes.data(), 0, nullptr);
     }
 
@@ -812,8 +848,8 @@ namespace vk {
       }
 
       // Transition target planes to GENERAL for storage writes
-      std::array<VkImageMemoryBarrier, 2> dst_barriers = {};
-      int num_dst_barriers = (num_imgs == 1) ? 1 : 2;
+      std::array<VkImageMemoryBarrier, 3> dst_barriers = {};
+      int num_dst_barriers = (num_imgs == 1) ? 1 : num_imgs;
       for (int i = 0; i < num_dst_barriers; i++) {
         dst_barriers[i] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         dst_barriers[i].srcAccessMask = target.initialized ? VK_ACCESS_SHADER_READ_BIT : 0;
@@ -955,6 +991,9 @@ namespace vk {
       if (target.uv_view) {
         vkDestroyImageView(vk_dev.dev, target.uv_view, nullptr);
       }
+      if (target.v_view) {
+        vkDestroyImageView(vk_dev.dev, target.v_view, nullptr);
+      }
       destroy_cursor_image();
       if (cmd.pool) {
         vkDestroyCommandPool(vk_dev.dev, cmd.pool, nullptr);
@@ -989,6 +1028,7 @@ namespace vk {
     int offset_x = 0;
     int offset_y = 0;
     bool is_10bit = false;
+    bool is_yuv444 = false;
     AVBufferRef *hw_frames_ctx = nullptr;
     frame_t hwframe;
     std::uint64_t sequence = 0;
@@ -1042,10 +1082,11 @@ namespace vk {
     std::array<src_image_t, DEFER_RING_SIZE> defer_ring = {};
     int defer_idx = 0;
 
-    // Target NV12 plane views
+    // Target NV12 or planar YUV444 views
     struct target_state_t {
       VkImageView y_view = VK_NULL_HANDLE;
       VkImageView uv_view = VK_NULL_HANDLE;
+      VkImageView v_view = VK_NULL_HANDLE;
       bool views_created = false;
       bool initialized = false;
     };

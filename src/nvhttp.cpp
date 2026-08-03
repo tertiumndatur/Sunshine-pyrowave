@@ -919,6 +919,7 @@ namespace nvhttp {
     // Sunshine extensions mirrored by the matching Moonlight client build.
     codec_mode_flags |= 0x00800000;  // SCM_PYROWAVE
     codec_mode_flags |= 0x01000000;  // SCM_PYROWAVE_METAL
+    codec_mode_flags |= 0x02000000;  // SCM_PYROWAVE_444
 #endif
     tree.put("root.ServerCodecModeSupport", codec_mode_flags);
 

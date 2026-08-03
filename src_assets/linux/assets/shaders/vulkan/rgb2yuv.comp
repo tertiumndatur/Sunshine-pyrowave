@@ -4,8 +4,9 @@ layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(set = 0, binding = 0) uniform sampler2D rgb_in;
 layout(set = 0, binding = 1) uniform writeonly image2D y_out;
-layout(set = 0, binding = 2) uniform writeonly image2D uv_out;
-layout(set = 0, binding = 3) uniform sampler2D cursor_in;
+layout(set = 0, binding = 2) uniform writeonly image2D u_or_uv_out;
+layout(set = 0, binding = 3) uniform writeonly image2D v_out;
+layout(set = 0, binding = 4) uniform sampler2D cursor_in;
 
 layout(push_constant) uniform PushConstants {
   vec4 color_vec_y;
@@ -21,6 +22,7 @@ layout(push_constant) uniform PushConstants {
   ivec2 cursor_pos;
   ivec2 cursor_size;  // w=0 means no cursor
   int y_invert;
+  int chroma_444;
 } pc;
 
 vec3 blend_cursor(vec3 rgb, ivec2 pos) {
@@ -46,8 +48,12 @@ void main() {
     float u_black = pc.color_vec_u.w * pc.range_uv.x + pc.range_uv.y;
     float v_black = pc.color_vec_v.w * pc.range_uv.x + pc.range_uv.y;
     imageStore(y_out, pos, vec4(y_black, 0, 0, 0));
-    if ((pos.x & 1) == 0 && (pos.y & 1) == 0)
-      imageStore(uv_out, pos >> 1, vec4(u_black, v_black, 0, 0));
+    if (pc.chroma_444 != 0) {
+      imageStore(u_or_uv_out, pos, vec4(u_black, 0, 0, 0));
+      imageStore(v_out, pos, vec4(v_black, 0, 0, 0));
+    } else if ((pos.x & 1) == 0 && (pos.y & 1) == 0) {
+      imageStore(u_or_uv_out, pos >> 1, vec4(u_black, v_black, 0, 0));
+    }
     return;
   }
 
@@ -66,8 +72,14 @@ void main() {
   float y = dot(pc.color_vec_y.xyz, rgb) + pc.color_vec_y.w;
   imageStore(y_out, pos, vec4(y * pc.range_y.x + pc.range_y.y, 0, 0, 0));
 
-  // UV plane (half resolution, one thread per 2x2 block)
-  if ((pos.x & 1) == 0 && (pos.y & 1) == 0) {
+  if (pc.chroma_444 != 0) {
+    float cb = dot(pc.color_vec_u.xyz, rgb) + pc.color_vec_u.w;
+    float cr = dot(pc.color_vec_v.xyz, rgb) + pc.color_vec_v.w;
+    imageStore(u_or_uv_out, pos, vec4(cb * pc.range_uv.x + pc.range_uv.y, 0, 0, 0));
+    imageStore(v_out, pos, vec4(cr * pc.range_uv.x + pc.range_uv.y, 0, 0, 0));
+  }
+  // Interleaved UV plane (half resolution, one thread per 2x2 block)
+  else if ((pos.x & 1) == 0 && (pos.y & 1) == 0) {
     vec2 step = scale * inv_tex;
     if (pc.y_invert != 0)
       step.y = -step.y;
@@ -86,7 +98,7 @@ void main() {
     float cb = dot(pc.color_vec_u.xyz, avg) + pc.color_vec_u.w;
     float cr = dot(pc.color_vec_v.xyz, avg) + pc.color_vec_v.w;
 
-    imageStore(uv_out, pos >> 1, vec4(cb * pc.range_uv.x + pc.range_uv.y,
-                                      cr * pc.range_uv.x + pc.range_uv.y, 0, 0));
+    imageStore(u_or_uv_out, pos >> 1, vec4(cb * pc.range_uv.x + pc.range_uv.y,
+                                           cr * pc.range_uv.x + pc.range_uv.y, 0, 0));
   }
 }

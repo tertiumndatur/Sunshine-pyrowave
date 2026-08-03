@@ -16,8 +16,11 @@
 #include <boost/pointer_cast.hpp>
 
 #ifdef SUNSHINE_BUILD_PYROWAVE
+  // PyroWave's public header uses Vulkan types and requires this include order.
+  // clang-format off
   #include <vulkan/vulkan.h>
   #include <pyrowave.h>
+// clang-format on
 #endif
 
 extern "C" {
@@ -474,8 +477,8 @@ namespace video {
 
       create_info = {};
       create_info.GetInstanceProcAddr = vulkan_context->get_proc_addr ?
-                                           vulkan_context->get_proc_addr :
-                                           vkGetInstanceProcAddr;
+                                          vulkan_context->get_proc_addr :
+                                          vkGetInstanceProcAddr;
       create_info.instance = vulkan_context->inst;
       create_info.physical_device = vulkan_context->phys_dev;
       create_info.device = vulkan_context->act_dev;
@@ -500,7 +503,7 @@ namespace video {
     }
 
     /**
-     * @brief Describe the converted Vulkan NV12 frame and its synchronization to PyroWave.
+     * @brief Describe the converted Vulkan YUV frame and its synchronization to PyroWave.
      *
      * @param conversion_device Sunshine Vulkan conversion device that owns the current frame.
      * @param hw_frames_context FFmpeg Vulkan frames context associated with the frame.
@@ -525,8 +528,9 @@ namespace video {
       auto *vk_frame = reinterpret_cast<AVVkFrame *>(frame->data[0]);
       auto *frames_context = reinterpret_cast<AVHWFramesContext *>(hw_frames_context->data);
       auto *vk_frames_context = reinterpret_cast<AVVulkanFramesContext *>(frames_context->hwctx);
-      if (frames_context->sw_format != AV_PIX_FMT_NV12) {
-        BOOST_LOG(error) << "PyroWave zero-copy expected an NV12 Vulkan frame"sv;
+      const bool yuv444 = frames_context->sw_format == AV_PIX_FMT_YUV444P;
+      if (!yuv444 && frames_context->sw_format != AV_PIX_FMT_NV12) {
+        BOOST_LOG(error) << "PyroWave zero-copy expected an NV12 or YUV444P Vulkan frame"sv;
         return false;
       }
 
@@ -534,13 +538,13 @@ namespace video {
       while (image_count < AV_NUM_DATA_POINTERS && vk_frame->img[image_count] != VK_NULL_HANDLE) {
         ++image_count;
       }
-      if (image_count != 1 && image_count != 2) {
-        BOOST_LOG(error) << "Unsupported Vulkan NV12 image count for PyroWave: "sv << image_count;
+      if ((yuv444 && image_count != 1 && image_count != 3) || (!yuv444 && image_count != 1 && image_count != 2)) {
+        BOOST_LOG(error) << "Unsupported Vulkan "sv << (yuv444 ? "YUV444P"sv : "NV12"sv)
+                         << " image count for PyroWave: "sv << image_count;
         return false;
       }
 
-      auto set_plane = [&](int plane, int image_index, VkFormat view_format,
-                           VkImageAspectFlagBits aspect, VkComponentSwizzle swizzle) {
+      auto set_plane = [&](int plane, int image_index, VkFormat view_format, VkImageAspectFlagBits aspect, VkComponentSwizzle swizzle) {
         auto &dst = buffers.planes[plane];
         dst.image = vk_frame->img[image_index];
         dst.width = frame->width;
@@ -554,7 +558,25 @@ namespace video {
         dst.layout = vk_frame->layout[image_index];
       };
 
-      if (image_count == 1) {
+      if (yuv444 && image_count == 1) {
+        set_plane(0, 0, VK_FORMAT_R8_UNORM, VK_IMAGE_ASPECT_PLANE_0_BIT, VK_COMPONENT_SWIZZLE_R);
+        set_plane(1, 0, VK_FORMAT_R8_UNORM, VK_IMAGE_ASPECT_PLANE_1_BIT, VK_COMPONENT_SWIZZLE_R);
+        set_plane(2, 0, VK_FORMAT_R8_UNORM, VK_IMAGE_ASPECT_PLANE_2_BIT, VK_COMPONENT_SWIZZLE_R);
+      } else if (yuv444) {
+        set_plane(0, 0, VK_FORMAT_R8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, VK_COMPONENT_SWIZZLE_R);
+        set_plane(1, 1, VK_FORMAT_R8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, VK_COMPONENT_SWIZZLE_R);
+        set_plane(2, 2, VK_FORMAT_R8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, VK_COMPONENT_SWIZZLE_R);
+
+        // PyroWave accepts a single acquire/release timeline. Separate YUV444
+        // images are safe only when FFmpeg exposes one shared timeline value.
+        if (vk_frame->sem[1] != vk_frame->sem[0] ||
+            vk_frame->sem[2] != vk_frame->sem[0] ||
+            vk_frame->sem_value[1] != vk_frame->sem_value[0] ||
+            vk_frame->sem_value[2] != vk_frame->sem_value[0]) {
+          BOOST_LOG(error) << "Three-image Vulkan YUV444P uses independent semaphores; zero-copy cannot synchronize it"sv;
+          return false;
+        }
+      } else if (image_count == 1) {
         set_plane(0, 0, VK_FORMAT_R8_UNORM, VK_IMAGE_ASPECT_PLANE_0_BIT, VK_COMPONENT_SWIZZLE_R);
         set_plane(1, 0, VK_FORMAT_R8G8_UNORM, VK_IMAGE_ASPECT_PLANE_1_BIT, VK_COMPONENT_SWIZZLE_R);
         set_plane(2, 0, VK_FORMAT_R8G8_UNORM, VK_IMAGE_ASPECT_PLANE_1_BIT, VK_COMPONENT_SWIZZLE_G);
@@ -620,7 +642,7 @@ namespace video {
     pyrowave_device_create_info create_info {};  ///< PyroWave imported-device descriptor.
     AVVkFrame *pending_frame = nullptr;  ///< Frame awaiting release synchronization.
     uint64_t pending_release_value = 0;  ///< Timeline value signaled after the current encode.
-    int image_count = 0;  ///< Number of Vulkan images used by the current NV12 frame.
+    int image_count = 0;  ///< Number of Vulkan images used by the current YUV frame.
   };
 #endif
 
@@ -655,7 +677,7 @@ namespace video {
     /**
      * @brief Construct a PyroWave session that uploads software-converted YUV input.
      *
-     * @param conversion_device Software conversion device that produces YUV420P frames.
+     * @param conversion_device Software conversion device that produces planar YUV frames.
      * @param device_handle PyroWave device owned by the session.
      * @param encoder_handle PyroWave encoder owned by the session.
      * @param config Negotiated stream configuration.
@@ -672,9 +694,9 @@ namespace video {
         config {config} {
     }
 
-#if defined(SUNSHINE_BUILD_VULKAN) && defined(__linux__)
+  #if defined(SUNSHINE_BUILD_VULKAN) && defined(__linux__)
     /**
-     * @brief Construct a PyroWave session that consumes shared Vulkan NV12 frames.
+     * @brief Construct a PyroWave session that consumes shared Vulkan YUV frames.
      *
      * @param conversion_device Vulkan conversion device that produces NV12 frames.
      * @param hw_frames_context FFmpeg Vulkan frames context owned by the session.
@@ -699,7 +721,7 @@ namespace video {
         config {config},
         gpu_input {true} {
     }
-#endif
+  #endif
 
     /**
      * @brief Destroy the PyroWave encoder and device.
@@ -766,7 +788,7 @@ namespace video {
       pyrowave_rate_control rate_control {maximum_bitstream_size};
       pyrowave_result result;
 
-#if defined(SUNSHINE_BUILD_VULKAN) && defined(__linux__)
+  #if defined(SUNSHINE_BUILD_VULKAN) && defined(__linux__)
       if (gpu_input) {
         auto *vulkan_conversion_device = dynamic_cast<platf::avcodec_encode_device_t *>(conversion_device.get());
         pyrowave_gpu_buffers gpu_buffers {};
@@ -787,7 +809,7 @@ namespace video {
           vulkan_state->complete_input();
         }
       } else
-#endif
+  #endif
       {
         auto *software_conversion_device = dynamic_cast<platf::avcodec_encode_device_t *>(conversion_device.get());
         if (!software_conversion_device || !software_conversion_device->frame) {
@@ -802,11 +824,14 @@ namespace video {
         cpu_buffer.row_stride_in_bytes[1] = frame->linesize[1];
         cpu_buffer.row_stride_in_bytes[2] = frame->linesize[2];
         cpu_buffer.plane_size_in_bytes[0] = (size_t) frame->linesize[0] * config.height;
-        cpu_buffer.plane_size_in_bytes[1] = (size_t) frame->linesize[1] * (config.height / 2);
-        cpu_buffer.plane_size_in_bytes[2] = (size_t) frame->linesize[2] * (config.height / 2);
+        const auto chroma_height = config.chromaSamplingType == 1 ? config.height : config.height / 2;
+        cpu_buffer.plane_size_in_bytes[1] = (size_t) frame->linesize[1] * chroma_height;
+        cpu_buffer.plane_size_in_bytes[2] = (size_t) frame->linesize[2] * chroma_height;
         cpu_buffer.width = config.width;
         cpu_buffer.height = config.height;
-        cpu_buffer.format = PYROWAVE_CPU_BUFFER_FORMAT_YUV420P;
+        cpu_buffer.format = config.chromaSamplingType == 1 ?
+                              PYROWAVE_CPU_BUFFER_FORMAT_YUV444P :
+                              PYROWAVE_CPU_BUFFER_FORMAT_YUV420P;
         result = pyrowave_encoder_encode_cpu_synchronous(encoder_handle, &cpu_buffer, &rate_control);
       }
 
@@ -862,10 +887,10 @@ namespace video {
 
   private:
     std::unique_ptr<platf::encode_device_t> conversion_device;  ///< Input conversion device.
-#if defined(SUNSHINE_BUILD_VULKAN) && defined(__linux__)
+  #if defined(SUNSHINE_BUILD_VULKAN) && defined(__linux__)
     avcodec_buffer_t hw_frames_context;  ///< FFmpeg Vulkan frames context for zero-copy input.
     std::unique_ptr<pyrowave_vulkan_device_state_t> vulkan_state;  ///< Shared Vulkan device state.
-#endif
+  #endif
     pyrowave_device device_handle = nullptr;  ///< Owned PyroWave device.
     pyrowave_encoder encoder_handle = nullptr;  ///< Owned PyroWave encoder.
     config_t config;  ///< Negotiated stream configuration.
@@ -2862,20 +2887,22 @@ namespace video {
     int capture_height,
     std::unique_ptr<platf::encode_device_t> encode_device
   ) {
-    if (config.dynamicRange || config.chromaSamplingType != 0) {
-      BOOST_LOG(error) << "PyroWave currently supports SDR 8-bit YUV 4:2:0 streams only"sv;
+    if (config.dynamicRange || (config.chromaSamplingType != 0 && config.chromaSamplingType != 1)) {
+      BOOST_LOG(error) << "PyroWave supports SDR 8-bit YUV 4:2:0 and 4:4:4 streams"sv;
       return nullptr;
     }
-    if ((config.width & 1) != 0 || (config.height & 1) != 0) {
+    const bool yuv444 = config.chromaSamplingType == 1;
+    if (!yuv444 && ((config.width & 1) != 0 || (config.height & 1) != 0)) {
       BOOST_LOG(error) << "PyroWave requires even stream dimensions"sv;
       return nullptr;
     }
 
     auto colorspace = encode_device->colorspace;
 
-#if defined(SUNSHINE_BUILD_VULKAN) && defined(__linux__)
+  #if defined(SUNSHINE_BUILD_VULKAN) && defined(__linux__)
     // KMS zero-copy path. The display hands us a DMA-BUF descriptor, the
-    // Vulkan conversion device imports it and writes NV12, and PyroWave reads
+    // Vulkan conversion device imports it and writes NV12 or planar YUV444,
+    // and PyroWave reads
     // the same VkImage on the same VkDevice.
     auto *raw_vulkan_device = dynamic_cast<platf::avcodec_encode_device_t *>(encode_device.get());
     if (raw_vulkan_device && raw_vulkan_device->data) {
@@ -2897,7 +2924,7 @@ namespace video {
 
       auto *frames_context = reinterpret_cast<AVHWFramesContext *>(hw_frames_context->data);
       frames_context->format = AV_PIX_FMT_VULKAN;
-      frames_context->sw_format = AV_PIX_FMT_NV12;
+      frames_context->sw_format = yuv444 ? AV_PIX_FMT_YUV444P : AV_PIX_FMT_NV12;
       frames_context->width = config.width;
       frames_context->height = config.height;
       frames_context->initial_pool_size = 0;
@@ -2951,7 +2978,9 @@ namespace video {
       encoder_info.device = device;
       encoder_info.width = config.width;
       encoder_info.height = config.height;
-      encoder_info.chroma = PYROWAVE_CHROMA_SUBSAMPLING_420;
+      encoder_info.chroma = yuv444 ?
+                              PYROWAVE_CHROMA_SUBSAMPLING_444 :
+                              PYROWAVE_CHROMA_SUBSAMPLING_420;
       result = pyrowave_encoder_create(&encoder_info, &encoder);
       if (result != PYROWAVE_SUCCESS) {
         BOOST_LOG(error) << "Failed to create the PyroWave zero-copy encoder: "sv << (int) result;
@@ -2961,7 +2990,9 @@ namespace video {
 
       BOOST_LOG(info) << "PyroWave Vulkan zero-copy encoder initialized at "sv
                       << config.width << 'x' << config.height
-                      << " (KMS DMA-BUF -> Vulkan NV12 -> GPU encode)"sv;
+                      << (yuv444 ?
+                            " (KMS DMA-BUF -> Vulkan YUV444P -> GPU encode)"sv :
+                            " (KMS DMA-BUF -> Vulkan NV12 -> GPU encode)"sv);
       return std::make_unique<pyrowave_encode_session_t>(
         std::move(vulkan_conversion_device),
         std::move(hw_frames_context),
@@ -2971,13 +3002,14 @@ namespace video {
         config
       );
     }
-#endif
+  #endif
 
     avcodec_frame_t frame {av_frame_alloc()};
     if (!frame) {
       return nullptr;
     }
-    frame->format = AV_PIX_FMT_YUV420P;
+    const auto software_format = yuv444 ? AV_PIX_FMT_YUV444P : AV_PIX_FMT_YUV420P;
+    frame->format = software_format;
     frame->width = config.width;
     frame->height = config.height;
 
@@ -2988,7 +3020,7 @@ namespace video {
     frame->colorspace = avcodec_colorspace.matrix;
 
     auto conversion_device = std::make_unique<avcodec_software_encode_device_t>();
-    if (conversion_device->init(capture_width, capture_height, frame.get(), AV_PIX_FMT_YUV420P, false)) {
+    if (conversion_device->init(capture_width, capture_height, frame.get(), software_format, false)) {
       BOOST_LOG(error) << "Failed to initialize PyroWave colorspace conversion"sv;
       return nullptr;
     }
@@ -3010,7 +3042,9 @@ namespace video {
     encoder_info.device = device;
     encoder_info.width = config.width;
     encoder_info.height = config.height;
-    encoder_info.chroma = PYROWAVE_CHROMA_SUBSAMPLING_420;
+    encoder_info.chroma = yuv444 ?
+                            PYROWAVE_CHROMA_SUBSAMPLING_444 :
+                            PYROWAVE_CHROMA_SUBSAMPLING_420;
     result = pyrowave_encoder_create(&encoder_info, &encoder);
     if (result != PYROWAVE_SUCCESS) {
       BOOST_LOG(error) << "Failed to create PyroWave encoder: "sv << (int) result;
@@ -3020,7 +3054,8 @@ namespace video {
 
     BOOST_LOG(info) << "PyroWave "sv
                     << (is_pyrowave_metal_format(config.videoFormat) ? "Metal v2 bitstream"sv : "Vulkan bitstream"sv)
-                    << " encoder initialized at "sv << config.width << 'x' << config.height;
+                    << " encoder initialized at "sv << config.width << 'x' << config.height
+                    << (yuv444 ? " YUV444"sv : " YUV420"sv);
     return std::make_unique<pyrowave_encode_session_t>(
       std::move(conversion_device),
       device,
@@ -3253,13 +3288,22 @@ namespace video {
     platf::pix_fmt_e pix_fmt;
     if (config.chromaSamplingType == 1) {
       // YUV 4:4:4
-      if (!(encoder.flags & YUV444_SUPPORT)) {
-        // Encoder can't support YUV 4:4:4 regardless of hardware capabilities
-        return {};
+#ifdef SUNSHINE_BUILD_PYROWAVE
+      if (is_pyrowave_format(config.videoFormat)) {
+        // The Vulkan PyroWave path allocates its own planar YUV444 frame. The
+        // capture backend only uses this value to choose the conversion device.
+        pix_fmt = encoder.platform_formats->pix_fmt_8bit;
+      } else
+#endif
+      {
+        if (!(encoder.flags & YUV444_SUPPORT)) {
+          // Encoder can't support YUV 4:4:4 regardless of hardware capabilities
+          return {};
+        }
+        pix_fmt = (colorspace.bit_depth == 10) ?
+                    encoder.platform_formats->pix_fmt_yuv444_10bit :
+                    encoder.platform_formats->pix_fmt_yuv444_8bit;
       }
-      pix_fmt = (colorspace.bit_depth == 10) ?
-                  encoder.platform_formats->pix_fmt_yuv444_10bit :
-                  encoder.platform_formats->pix_fmt_yuv444_8bit;
     } else {
       // YUV 4:2:0
       pix_fmt = (colorspace.bit_depth == 10) ?
